@@ -1,4 +1,4 @@
-#Include "TOTVS.ch"
+#Include "TOTVS.CH"
 #Include "TopConn.ch"
 #Include "FWMVCDef.ch"
 
