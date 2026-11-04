@@ -27,6 +27,7 @@ User Function TSOMS03G(cCarga, cSeq, cDir, lConf)
 	Local cQryNF         := GetNextAlias()
 	Local lAchou         := .F.
 	Local lTemNF         := .F.
+	Local nFis           := 0
 
 	Default cSeq  := ""
 	Default lConf := .F.
@@ -80,7 +81,6 @@ User Function TSOMS03G(cCarga, cSeq, cDir, lConf)
 	EndSql
 	lTemNF := (cQryNF)->QTD > 0
 	(cQryNF)->(dbCloseArea())
-
 	cArquivo := "relCargas1_" + AllTrim(cCarga) + "_" + RetCodUSR() + StrTran(Time(), ":", "")
 
 	// New(cFile, lLandscape, lImpPDF, cPathInServer, lDisableSetup, oPrintSetup, cPrinter, lViewPDF)
@@ -89,8 +89,17 @@ User Function TSOMS03G(cCarga, cSeq, cDir, lConf)
 	oRel := IpFwMsPrinter():New(cArquivo,,, cDir, .T.,,, .F.)
 
 	oRel:StartPage()
-	Processa({|| ImpRel()}, 'Gerando romaneio da carga ' + AllTrim(cCarga) + '...')
+	// Chamado direto (sem Processa): o painel ja esta dentro de um Processa,
+	// e um Processa dentro do outro deixa a sessao em estado inconsistente
+	ImpRel()
 	oRel:EndPage()
+
+	// Garante que o calculo fiscal usado no impCodigo (MaFisIni por item)
+	// nao fique aberto para o proximo faturamento
+	While nFis < 20 .and. MaFisFound("NF")
+		MaFisEnd()
+		nFis++
+	EndDo
 
 	// Conferencia de carga no mesmo PDF (mesma ordem da rotina original)
 	If lConf .and. (lRet .or. lTemNF)

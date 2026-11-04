@@ -238,6 +238,8 @@ Return
 // Abre a rotina de boletos atual (provisorio, ate integrar o fonte no painel)
 User Function ZPFBOL()
 
+    Local aAreas := ZSalvaAreas()
+
     If ExistBlock("IMPRIMEBOL")
         ExecBlock("IMPRIMEBOL", .F., .F.)          // U_IMPRIMEBOL
     ElseIf FindFunction("IMPRIMEBOL")
@@ -246,12 +248,140 @@ User Function ZPFBOL()
         MsgStop("Rotina IMPRIMEBOL nao encontrada no RPO.", "Atencao")
     EndIf
 
+    // A rotina de boleto (compilada, sem fonte) pode deixar filtros/ordens
+    // em SE1, SF2 etc. Limpa para nao atrapalhar o proximo faturamento.
+    ZLimpaAmb()
+    ZRestAreas(aAreas)
+
 Return
 
-// Apenas abre o Documento de Saida por Carga padrao e atualiza ao voltar
+// Abre o Documento de Saida por Carga padrao e atualiza ao voltar.
+// Antes de abrir, devolve o ambiente ao estado "limpo" (como se a rotina
+// fosse aberta pelo menu): sem filtros, ordem 1, sem travas e sem as
+// variaveis deixadas pelo romaneio/DANFE/boleto.
 User Function ZPFFAT()
+
+    Local aAreas    := ZSalvaAreas()
+    Local aRotSave  := IIf(Type("aRotina")   == "A", aClone(aRotina), {})
+    Local cCadSave  := IIf(Type("cCadastro") == "C", cCadastro, "")
+
+    ZLimpaAmb()
+
     MATA460B()
+
+    // Devolve o menu do painel (o MATA460B usa o mesmo nome aRotina)
+    If Type("aRotina") == "A" .And. !Empty(aRotSave)
+        aRotina := aRotSave
+    EndIf
+    If Type("cCadastro") == "C"
+        cCadastro := cCadSave
+    EndIf
+
+    ZLimpaAmb()
+    ZRestAreas(aAreas)
     U_ZPFATU()
+
+Return
+
+//------------------------------------------------------------------
+// Deixa as tabelas do faturamento sem filtro, na ordem 1, e libera
+// travas de registro e variaveis publicas que ficaram de outras rotinas.
+Static Function ZLimpaAmb()
+
+    Local aTabs := {"SC5","SC6","SC9","SD2","SF2","SF3","SFT","SE1","SE4", ;
+                    "DAK","DAI","SA1","SA4","SB1","SB2","SF4"}
+    Local nFis  := 0
+    Local nI
+
+    For nI := 1 To Len(aTabs)
+        If Select(aTabs[nI]) > 0
+            (aTabs[nI])->(DbClearFilter())
+            (aTabs[nI])->(DbSetOrder(1))
+        EndIf
+    Next nI
+
+    // Travas de registro esquecidas nesta thread
+    MsUnlockAll()
+
+    // Calculo fiscal (MATXFIS) deixado aberto pelo romaneio: o impCodigo do
+    // TSOMS03 chama MaFisIni a cada item e so encerra uma vez. Se ficar
+    // aberto, o faturamento seguinte (que tambem usa MaFis) e recusado.
+    nFis := 0
+    While nFis < 20 .And. MaFisFound("NF")
+        MaFisEnd()
+        nFis++
+    EndDo
+
+    // Publicas criadas pelo TSOMS03G / SIROMS02 / DANFEProc
+    If Type("oRel") <> "U"
+        oRel := Nil
+    EndIf
+    If Type("cArquivo") <> "U"
+        cArquivo := ""
+    EndIf
+
+Return
+
+// Lista os alias abertos nesta sessao
+Static Function ZAliases()
+
+    Local aRet   := {}
+    Local cAls   := ""
+    Local bErro  := ErrorBlock({|oErr| Break(oErr)})
+    Local nI
+
+    // O numero maximo de areas de trabalho varia por ambiente; Alias(n) acima
+    // do limite gera erro ("parameter not valid"). Percorre ate onde der.
+    Begin Sequence
+        For nI := 1 To 1024
+            cAls := Alias(nI)
+            If !Empty(cAls)
+                aAdd(aRet, cAls)
+            EndIf
+        Next nI
+    Recover
+        // chegou no limite de areas: o que foi lido ate aqui basta
+    End Sequence
+
+    ErrorBlock(bErro)
+
+Return aRet
+
+// Fecha as consultas abertas depois de aAntes (so alias de consulta,
+// com nome longo do GetNextAlias; tabelas como SF2/DAK ficam abertas)
+Static Function ZFechaNovos(aAntes)
+
+    Local aDepois := ZAliases()
+    Local cAls    := ""
+    Local nI
+
+    For nI := 1 To Len(aDepois)
+        cAls := aDepois[nI]
+        If aScan(aAntes, {|x| x == cAls}) == 0 .And. Len(AllTrim(cAls)) > 3 .And. cAls <> cAlsTmp
+            (cAls)->(DbCloseArea())
+        EndIf
+    Next nI
+
+Return
+
+Static Function ZSalvaAreas()
+
+    Local aAreas := {GetArea()}
+
+    If Select(cAlsTmp) > 0
+        aAdd(aAreas, (cAlsTmp)->(GetArea()))
+    EndIf
+
+Return aAreas
+
+Static Function ZRestAreas(aAreas)
+
+    Local nI
+
+    For nI := Len(aAreas) To 1 Step -1
+        RestArea(aAreas[nI])
+    Next nI
+
 Return
 
 //------------------------------------------------------------------
@@ -261,6 +391,7 @@ User Function ZPFGER()
     Local aCargas := {}
     Local cMarca  := oMark:Mark()
     Local aArea   := (cAlsTmp)->(GetArea())
+    Local aAntes  := {}
 
     (cAlsTmp)->(DbGoTop())
     While !(cAlsTmp)->(Eof())
@@ -276,7 +407,14 @@ User Function ZPFGER()
         Return
     EndIf
 
+    aAntes := ZAliases()
+
     Processa({|| ZGerar(aCargas)}, "Aguarde", "Gerando documentos...")
+
+    // O romaneio (TSOMS03/SIROMS02) abre consultas e nao fecha; com elas
+    // abertas o MATA460B nao consegue gravar SC9/SF2 na mesma sessao.
+    ZFechaNovos(aAntes)
+    ZLimpaAmb()            // filtros, ordens, travas e calculo fiscal (MaFis)
     oMark:Refresh(.T.)
 
 Return
@@ -303,7 +441,7 @@ Static Function ZGerar(aCargas)
     Private MV_PAR02 := ""
     Private MV_PAR03 := ""
     Private MV_PAR04 := 2          // Operacao: 2 = saida
-    Private MV_PAR05 := 1          // Frente e verso: 1 = sim
+    Private MV_PAR05 := 2          // Frente e verso: 2 = nao (com 1, a folha 2 so usa metade da pagina)
     Private MV_PAR06 := 2          // DANFE simplificado: 2 = nao
     Private MV_PAR07 := CToD("")   // Emissao de (vazio = sem filtro)
     Private MV_PAR08 := CToD("")   // Emissao ate
@@ -537,7 +675,7 @@ Static Function ZDanfeAdd(oDanfe, cNota, cSerie, cIdEnt)
     MV_PAR02 := cNota
     MV_PAR03 := cSerie
     MV_PAR04 := 2
-    MV_PAR05 := 1
+    MV_PAR05 := 2      // Frente e verso = nao: folhas 2+ usam a pagina inteira
     MV_PAR06 := 2
     MV_PAR07 := CToD("")
     MV_PAR08 := CToD("")
