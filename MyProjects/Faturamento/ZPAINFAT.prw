@@ -76,7 +76,7 @@ Static Function ZPerg()
     Local aPergs := {}
     Local aRet   := {}
 
-    aAdd(aPergs, {1, "Data da carga de" , IIf(Empty(dParDe) , Date() - 7, dParDe) , "", "", "", "", 60, .T.})
+    aAdd(aPergs, {1, "Data da carga de" , IIf(Empty(dParDe) , Date() - 1, dParDe) , "", "", "", "", 60, .T.})
     aAdd(aPergs, {1, "Data da carga ate", IIf(Empty(dParAte), Date()    , dParAte), "", "", "", "", 60, .T.})
 
     If !ParamBox(aPergs, "Painel de Documentos por Carga", @aRet)
@@ -322,48 +322,6 @@ Static Function ZLimpaAmb()
 
 Return
 
-// Lista os alias abertos nesta sessao
-Static Function ZAliases()
-
-    Local aRet   := {}
-    Local cAls   := ""
-    Local bErro  := ErrorBlock({|oErr| Break(oErr)})
-    Local nI
-
-    // O numero maximo de areas de trabalho varia por ambiente; Alias(n) acima
-    // do limite gera erro ("parameter not valid"). Percorre ate onde der.
-    Begin Sequence
-        For nI := 1 To 1024
-            cAls := Alias(nI)
-            If !Empty(cAls)
-                aAdd(aRet, cAls)
-            EndIf
-        Next nI
-    Recover
-        // chegou no limite de areas: o que foi lido ate aqui basta
-    End Sequence
-
-    ErrorBlock(bErro)
-
-Return aRet
-
-// Fecha as consultas abertas depois de aAntes (so alias de consulta,
-// com nome longo do GetNextAlias; tabelas como SF2/DAK ficam abertas)
-Static Function ZFechaNovos(aAntes)
-
-    Local aDepois := ZAliases()
-    Local cAls    := ""
-    Local nI
-
-    For nI := 1 To Len(aDepois)
-        cAls := aDepois[nI]
-        If aScan(aAntes, {|x| x == cAls}) == 0 .And. Len(AllTrim(cAls)) > 3 .And. cAls <> cAlsTmp
-            (cAls)->(DbCloseArea())
-        EndIf
-    Next nI
-
-Return
-
 Static Function ZSalvaAreas()
 
     Local aAreas := {GetArea()}
@@ -388,15 +346,25 @@ Return
 // Botao "Gerar documentos"
 User Function ZPFGER()
 
-    Local aCargas := {}
-    Local cMarca  := oMark:Mark()
-    Local aArea   := (cAlsTmp)->(GetArea())
-    Local aAntes  := {}
+    Local aCargas  := {}
+    Local cMarca   := oMark:Mark()
+    Local aArea    := (cAlsTmp)->(GetArea())
+    Local cBase    := "\spool\fatcarga\"
+    Local cExec    := cBase + AllTrim(RetCodUsr()) + "_" + DToS(Date()) + "_" + StrTran(Time(), ":", "") + "\"
+    Local cParam   := ""
+    Local cRet     := ""
+    Local aLinhas  := {}
+    Local aLog     := {}
+    Local aFiles   := {}
+    Local nPos     := 0
+    Local nI
 
     (cAlsTmp)->(DbGoTop())
     While !(cAlsTmp)->(Eof())
         If (cAlsTmp)->TR_OK == cMarca
             aAdd(aCargas, {(cAlsTmp)->TR_CARGA, (cAlsTmp)->TR_SEQCAR, (cAlsTmp)->(Recno())})
+            // carga + sequencia com tamanho fixo (sequencia vazia preservada)
+            cParam += IIf(Empty(cParam), "", "|") + (cAlsTmp)->TR_CARGA + (cAlsTmp)->TR_SEQCAR
         EndIf
         (cAlsTmp)->(DbSkip())
     EndDo
@@ -407,30 +375,85 @@ User Function ZPFGER()
         Return
     EndIf
 
-    aAntes := ZAliases()
+    ZMkDir(cBase)
+    ZMkDir(cExec)
 
-    Processa({|| ZGerar(aCargas)}, "Aguarde", "Gerando documentos...")
+    // A geracao roda em OUTRA thread (StartJob). Tudo o que o DANFE, o
+    // romaneio (TSOMS03/SIROMS02) e o calculo fiscal deixam "sujo" morre
+    // junto com essa thread, e a sessao da tela fica limpa para o MATA460B -
+    // igual a fechar e abrir o painel. Os arquivos ficam em cExec no servidor.
+    FWMsgRun(, {|| cRet := StartJob("U_ZPFJOB", GetEnvServer(), .T., cEmpAnt, cFilAnt, cParam, cExec) }, ;
+             "Aguarde", "Gerando documentos de " + cValToChar(Len(aCargas)) + " carga(s)...")
 
-    // O romaneio (TSOMS03/SIROMS02) abre consultas e nao fecha; com elas
-    // abertas o MATA460B nao consegue gravar SC9/SF2 na mesma sessao.
-    ZFechaNovos(aAntes)
-    ZLimpaAmb()            // filtros, ordens, travas e calculo fiscal (MaFis)
+    If ValType(cRet) <> "C" .Or. Empty(cRet)
+        aAdd(aLog, "A geracao em segundo plano nao retornou resultado. Verifique o console.log do servidor.")
+    Else
+        aLinhas := StrTokArr2(cRet, CRLF, .F.)
+        For nI := 1 To Len(aLinhas)
+            If Left(aLinhas[nI], 4) == "#OK#"
+                // carga gerada com sucesso: marca como gerada na tela
+                nPos := aScan(aCargas, {|x| x[1] + x[2] == SubStr(aLinhas[nI], 5)})
+                If nPos > 0
+                    (cAlsTmp)->(DbGoTo(aCargas[nPos,3]))
+                    RecLock(cAlsTmp, .F.)
+                        (cAlsTmp)->TR_STATUS := "G"
+                        (cAlsTmp)->TR_OK     := "  "
+                    (cAlsTmp)->(MsUnlock())
+                EndIf
+            Else
+                aAdd(aLog, aLinhas[nI])
+            EndIf
+        Next nI
+    EndIf
+
+    // Copia os arquivos gerados para a maquina do usuario
+    ZListaArq(cExec, @aFiles)
+    If !Empty(aFiles)
+        ZEntrega(aFiles)
+    EndIf
+
+    // Limpa o servidor
+    aEval(aFiles, {|x| FErase(x)})
+    DirRemove(cExec)
+
+    RestArea(aArea)
     oMark:Refresh(.T.)
+    ZShowLog(aLog)
 
 Return
 
 //------------------------------------------------------------------
-Static Function ZGerar(aCargas)
+// Thread separada (StartJob) que gera XML, DANFE e romaneio.
+// Retorna texto: uma linha "#OK#<carga+seq>" para cada carga gerada
+// e as demais linhas sao mensagens para o resumo.
+User Function ZPFJOB(cEmp, cFil, cParam, cExec)
 
-    Local cBase    := "\spool\fatcarga\"
+    Local cRet := ""
+
+    RpcSetType(3)                    // nao consome licenca
+    RpcSetEnv(cEmp, cFil, , , "OMS")
+
+    cRet := ZGerar(cParam, cExec)
+
+    RpcClearEnv()
+
+Return cRet
+
+//------------------------------------------------------------------
+// Roda dentro da thread do ZPFJOB (sem tela)
+Static Function ZGerar(cParam, cExec)
+
     Local cStamp   := DToS(Date()) + "_" + StrTran(Time(), ":", "")
-    Local cExec    := cBase + AllTrim(RetCodUsr()) + "_" + cStamp + "\"
+    Local nTamCod  := TamSX3("DAK_COD")[1]
+    Local aTok     := StrTokArr(cParam, "|")
     Local aLog     := {}
-    Local aFiles   := {}
+    Local cRet     := ""
     Local cIdEnt   := ""
     Local cUrlTss  := AllTrim(SuperGetMV("MV_SPEDURL", .F., ""))
     Local oDanfe   := Nil
     Local nDanfes  := 0
+    Local cCarga   := ""
+    Local cSeq     := ""
     Local nI
 
     // Variaveis que o U_DANFEProc (danfeii.prw) espera encontrar
@@ -447,13 +470,9 @@ Static Function ZGerar(aCargas)
     Private MV_PAR08 := CToD("")   // Emissao ate
 
     If !FindFunction("RetIdEnti")
-        MsgStop("Funcao RetIdEnti nao encontrada no RPO. Verificar com a TI.", "Atencao")
-        Return
+        Return "Funcao RetIdEnti nao encontrada no RPO. Verificar com a TI."
     EndIf
     cIdEnt := RetIdEnti()
-
-    ZMkDir(cBase)
-    ZMkDir(cExec)
 
     // Um unico PDF com os DANFEs de todas as notas desta geracao
     If ExistBlock("DANFEProc")
@@ -462,18 +481,12 @@ Static Function ZGerar(aCargas)
         aAdd(aLog, "U_DANFEProc nao encontrado no RPO - DANFEs nao gerados.")
     EndIf
 
-    ProcRegua(Len(aCargas))
+    For nI := 1 To Len(aTok)
+        cCarga := Left(aTok[nI], nTamCod)
+        cSeq   := SubStr(aTok[nI], nTamCod + 1)
 
-    For nI := 1 To Len(aCargas)
-
-        IncProc("Carga " + AllTrim(aCargas[nI,1]))
-
-        If ZGeraCarga(aCargas[nI,1], aCargas[nI,2], cExec, cIdEnt, cUrlTss, @aLog, oDanfe, @nDanfes)
-            (cAlsTmp)->(DbGoTo(aCargas[nI,3]))
-            RecLock(cAlsTmp, .F.)
-                (cAlsTmp)->TR_STATUS := "G"
-                (cAlsTmp)->TR_OK     := "  "
-            (cAlsTmp)->(MsUnlock())
+        If ZGeraCarga(cCarga, cSeq, cExec, cIdEnt, cUrlTss, @aLog, oDanfe, @nDanfes)
+            cRet += "#OK#" + aTok[nI] + CRLF
         EndIf
     Next nI
 
@@ -486,19 +499,9 @@ Static Function ZGerar(aCargas)
         oDanfe := Nil
     EndIf
 
-    ZListaArq(cExec, @aFiles)
+    aEval(aLog, {|x| cRet += x + CRLF})
 
-    If !Empty(aFiles)
-        ZEntrega(aFiles)
-    EndIf
-
-    // Limpa o servidor
-    aEval(aFiles, {|x| FErase(x)})
-    DirRemove(cExec)
-
-    ZShowLog(aLog)
-
-Return
+Return cRet
 
 //------------------------------------------------------------------
 // Gera os documentos de uma carga. Retorna .T. se gerou tudo.
